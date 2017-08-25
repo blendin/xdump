@@ -14,8 +14,9 @@
 #include <string.h>
 #include <fcntl.h>
 #include <time.h>
+#include <errno.h>
 
-#define MAXBUF    8096
+#define MAXBUF    8192
 
 /* User defined values */
 #define DEBUG     0
@@ -23,6 +24,11 @@
 #define MAPPREFIX "map-"
 #define MEMPREFIX "mem-"
 #define BINSUFFIX ".bin"
+
+#define LOW_ADDR  PAGE_SIZE
+#define HIGH_ADDR 0xffffffff
+
+#define USE_PROC_DIR 1
 /* End user defined values */
 
 #define debug(x...) { \
@@ -41,24 +47,11 @@ void usage(char *myname) {
   exit(3);
 }
 
-int do_trace(pid_t child) {
-  FILE *mapfile;
-  int status, memfile, i;
+int dump_with_proc(FILE *mapfile, pid_t child) {
+  int i;
   char tmp[MAXBUF];
   int *writeptr;
   char *filepath;
-
-  waitpid(child, &status, 0);
-  assert(WIFSTOPPED(status));
-
-  sprintf(tmp, "/proc/%d/maps", child);
-  mapfile=fopen(tmp, "r");
-
-  if (!mapfile) fatal("Cannot open %s for reading.\n", tmp);
-
-  sprintf(tmp, "/proc/%d/mem", child);
-  memfile = open(tmp, O_RDONLY);
-  if (memfile < 0) fatal("Cannot open %s for reading.\n", tmp);
 
   while (fgets(tmp, MAXBUF, mapfile)) {
     int dumpfile, dumpcnt;
@@ -99,6 +92,69 @@ int do_trace(pid_t child) {
     close(dumpfile);
   }
 
+  return 1;
+}
+
+int dump_segment(pid_t child, size_t addr) {
+  char small[MAXBUF];
+  int *writeptr;
+  int i, dumpfile;
+
+  memset(small, 0, MAXBUF);
+  writeptr = calloc(PAGE_SIZE, 1);
+  for (i = 0; i < PAGE_SIZE/4; i++)
+    writeptr[i] = ptrace(PTRACE_PEEKDATA, child, i*4+addr, 0);
+
+  sprintf(small, MEMPREFIX "%zx-%zx" BINSUFFIX, addr, addr+PAGE_SIZE);
+
+  dumpfile = open(small, O_WRONLY | O_TRUNC | O_CREAT | O_EXCL, 0600);
+  if (dumpfile < 0) fatal("Cannot open output file %s.\n", small);
+
+  if (write(dumpfile, writeptr, PAGE_SIZE) != PAGE_SIZE)
+    fatal("Short write to %s.\n", small);
+
+  return 1;
+}
+
+int do_memsearch(pid_t child) {
+  size_t lo_addr, hi_addr, addr;
+
+  lo_addr = LOW_ADDR;
+  hi_addr = HIGH_ADDR;
+
+  for (addr = lo_addr; addr < hi_addr; addr += PAGE_SIZE) {
+    errno = 0;
+    int q = ptrace(PTRACE_PEEKDATA, child, addr, 0);
+    if (errno == 0) {
+      if (DEBUG) debug("found: %zx %x\n", addr, q);
+      dump_segment(child, addr);
+    }
+  }
+
+  return 1;
+}
+
+int do_trace(pid_t child) {
+  FILE *mapfile;
+  int status, canproc;
+  char tmp[MAXBUF];
+
+
+  waitpid(child, &status, 0);
+  assert(WIFSTOPPED(status));
+
+  sprintf(tmp, "/proc/%d/maps", child);
+  mapfile=fopen(tmp, "r");
+
+  canproc = USE_PROC_DIR;
+  if (!mapfile) {
+    canproc = 0;
+  }
+
+  if (canproc)  dump_with_proc(mapfile, child);
+  else          do_memsearch(child);
+
+
   ptrace(PTRACE_DETACH);
   return 0;
 }
@@ -106,20 +162,24 @@ int do_trace(pid_t child) {
 int do_child(int argc, char **argv) {
   char *args [argc+1];
   int i;
-  debug("execvp(%s, args) \n", args[0]);
 
   for (i = 0; i < argc; i++)
     args[i] = argv[i];
-  args[argc] = NULL;
 
-  ptrace(PTRACE_TRACEME);
-  return execvp(args[0], args);
+  args[argc] = NULL;
+  debug("argc %d execvp(%s, args) \n", argc, args[0]);
+
+  if (ptrace(PTRACE_TRACEME) == 0) {
+    return execvp(args[0], args);
+  }
+
+  fatal("Couldn't attach to process");
 }
 
 int main(int argc, char *argv[]) {
   pid_t child;
 
-  if (DEBUG) debug("version 0.1 brendon tiszka");
+  if (DEBUG) debug("version 0.1 brendon tiszka\n\n");
 
   if (argc<2) usage(argv[0]);
 
